@@ -13,6 +13,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk/cassandra"
 	"github.com/cortexproject/cortex/pkg/chunk/gcp"
 	"github.com/cortexproject/cortex/pkg/chunk/local"
+	"github.com/cortexproject/cortex/pkg/chunk/sql"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
@@ -39,6 +40,7 @@ type Config struct {
 	GCSConfig              gcp.GCSConfig      `yaml:"gcs"`
 	CassandraStorageConfig cassandra.Config   `yaml:"cassandra"`
 	BoltDBConfig           local.BoltDBConfig `yaml:"boltdb"`
+	SQLDBConfig            sql.Config         `yaml:"sql"`
 	FSConfig               local.FSConfig     `yaml:"filesystem"`
 
 	IndexCacheValidity time.Duration
@@ -53,6 +55,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.GCSConfig.RegisterFlags(f)
 	cfg.CassandraStorageConfig.RegisterFlags(f)
 	cfg.BoltDBConfig.RegisterFlags(f)
+	cfg.SQLDBConfig.RegisterFlags(f)
 	cfg.FSConfig.RegisterFlags(f)
 
 	f.StringVar(&cfg.Engine, "store.engine", "chunks", "The storage engine to use: chunks or tsdb. Be aware tsdb is experimental and shouldn't be used in production.")
@@ -137,6 +140,8 @@ func NewIndexClient(name string, cfg Config, schemaCfg chunk.SchemaConfig) (chun
 		return cassandra.NewStorageClient(cfg.CassandraStorageConfig, schemaCfg)
 	case "boltdb":
 		return local.NewBoltDBIndexClient(cfg.BoltDBConfig)
+	case "sql":
+		return sql.NewStorageClient(cfg.SQLDBConfig)
 	default:
 		return nil, fmt.Errorf("Unrecognized storage client %v, choose one of: aws, cassandra, inmemory, gcp, bigtable, bigtable-hashed", name)
 	}
