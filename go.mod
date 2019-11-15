@@ -24,6 +24,7 @@ require (
 	github.com/fluent/fluent-logger-golang v1.2.1 // indirect
 	github.com/fsouza/fake-gcs-server v1.3.0
 	github.com/go-kit/kit v0.9.0
+	github.com/go-sql-driver/mysql v1.4.1
 	github.com/gocql/gocql v0.0.0-20180113133114-697e7c57f99b
 	github.com/gogo/googleapis v1.1.0 // indirect
 	github.com/gogo/protobuf v1.2.2-0.20190730201129-28a6bbf47e48
