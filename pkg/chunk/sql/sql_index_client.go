@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
@@ -16,22 +17,20 @@ import (
 )
 
 type Config struct {
-	DSN        string
-	Driver     string
-	IndexTable string
+	DSN    string
+	Driver string
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.DSN, "sql.dsn", "", "DSN for connecting to the database")
 	f.StringVar(&cfg.Driver, "sql.driver", "postgresql", "The database driver to use")
-	f.StringVar(&cfg.Driver, "sql.indexTable", "cortex_chunk_indices", "")
 }
 
 // StorageClient implements chunk.IndexClient for SQL databases.
 type StorageClient struct {
-	db         *sql.DB
-	indexTable string
+	db  *sql.DB
+	cfg Config
 }
 
 var (
@@ -46,28 +45,50 @@ func NewStorageClient(cfg Config) (*StorageClient, error) {
 		return nil, err
 	}
 
-	client := &StorageClient{
-		db:         db,
-		indexTable: cfg.IndexTable,
-	}
-
-	if err := client.createTable(); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	return client, nil
+	return &StorageClient{
+		db:  db,
+		cfg: cfg,
+	}, nil
 }
 
-func (s *StorageClient) createTable() error {
-	_, err := s.db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-	table varchar,
-	hash varchar,
-	range varchar,
-	value varchar,
-	PRIMARY KEY(table, hash)
-	)`, s.indexTable))
-	if err != nil {
-		return errors.Wrap(err, "create table failed")
+func (s *StorageClient) createTable(tableName string) error {
+	switch s.cfg.Driver {
+	case "mysql":
+		_, err := s.db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		hash VARCHAR,
+		range BLOB,
+		value BLOB,
+		PRIMARY KEY(hash)
+		)`, tableName))
+		if err != nil {
+			return errors.Wrap(err, "create table failed")
+		}
+		_, err = s.db.Exec(fmt.Sprintf(`
+		CREATE INDEX range_index ON %s (range);
+		CREATE INDEX value_index ON %s (value);
+		`, tableName, tableName))
+		// TODO handle index exists
+		if err != nil {
+			return errors.Wrap(err, "create index failed")
+		}
+	case "postgresl":
+		_, err := s.db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		hash VARCHAR,
+		range BYTEA,
+		value BYTEA,
+		PRIMARY KEY(hash)
+		)`, tableName))
+		if err != nil {
+			return errors.Wrap(err, "create table failed")
+		}
+		_, err = s.db.Exec(fmt.Sprintf(`
+		CREATE INDEX range_index ON %s (range);
+		CREATE INDEX value_index ON %s (value);
+		`, tableName, tableName))
+		// TODO handle index exists
+		if err != nil {
+			return errors.Wrap(err, "create index failed")
+		}
 	}
 	return nil
 }
@@ -100,8 +121,19 @@ func (s *StorageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) 
 	b := batch.(*writeBatch)
 
 	for _, entry := range b.entries {
-		result, err := s.db.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s (table, hash, range, value) VALUES ('%s', '%s', '%s', '%s')",
-			s.indexTable, entry.TableName, entry.HashValue, string(entry.RangeValue), string(entry.Value)))
+		err := s.createTable(entry.TableName)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		var query string
+		switch s.cfg.Driver {
+		case "mysql":
+			query = fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES ('%s', x'%x', x'%x')", entry.TableName, entry.HashValue, entry.RangeValue, entry.Value)
+		case "postgresql":
+			query = fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES ('%s', decode('%s', 'hex'), decode('%s', 'hex'))", entry.TableName, entry.HashValue, entry.RangeValue, entry.Value)
+		}
+		result, err := s.db.ExecContext(ctx, query)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -113,7 +145,6 @@ func (s *StorageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) 
 			return errors.Errorf("expected to affect 1 row, affected %d", numRows)
 		}
 	}
-
 	return nil
 }
 
@@ -123,30 +154,38 @@ func (s *StorageClient) QueryPages(ctx context.Context, queries []chunk.IndexQue
 	// whatever, we filter them in the cache on the client.  But for unit tests to
 	// pass, we must do this.
 	callback = util.QueryFilter(callback)
-
-	// var comparisons []string
-	// for _, indexQuery := range queries {
-
-	// }
-	query := fmt.Sprintf(`SELECT range, value FROM %s`, s.indexTable)
-	rows, err := s.db.QueryContext(ctx, query)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	defer rows.Close()
-
-	rowsBatch := &rowsBatch{rows: rows}
 	for _, query := range queries {
-		callback(query, rowsBatch)
+		var builder strings.Builder
+		builder.WriteString(fmt.Sprintf(`SELECT table, range, value FROM %s WHERE hash = '%s'`, query.TableName, query.HashValue))
+
+		if len(query.RangeValuePrefix) != 0 {
+			builder.WriteString(fmt.Sprintf(` AND range LIKE '%s%%'`, string(query.RangeValuePrefix)))
+		} else if len(query.RangeValueStart) != 0 {
+			builder.WriteString(fmt.Sprintf(` AND range >= '%s'`, string(query.RangeValueStart)))
+		}
+		if len(query.ValueEqual) != 0 {
+			builder.WriteString(fmt.Sprintf(` AND value == '%s'`, string(query.ValueEqual)))
+		}
+
+		rows, err := s.db.QueryContext(ctx, builder.String())
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		defer rows.Close()
+
+		rowsBatch := &rowsBatch{rows: rows}
+		for _, query := range queries {
+			callback(query, rowsBatch)
+		}
+
+		// Check for errors from iterating over rows.
+		if err := rows.Err(); err != nil {
+			return errors.WithStack(err)
+
+		}
+
 	}
-
-	// Check for errors from iterating over rows.
-	if err := rows.Err(); err != nil {
-		return errors.WithStack(err)
-
-	}
-
 	return nil
 }
 
