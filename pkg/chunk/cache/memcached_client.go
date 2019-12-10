@@ -113,6 +113,10 @@ func (c *memcachedClient) updateLoop(updateInterval time.Duration) {
 // updateMemcacheServers sets a memcache server list from SRV records. SRV
 // priority & weight are ignored.
 func (c *memcachedClient) updateMemcacheServers() error {
+	if c.service == "" {
+		level.Debug(util.Logger).Log("msg", "skipping update of memcache servers due to memcached.service=''")
+		return nil
+	}
 	_, addrs, err := net.LookupSRV(c.service, "tcp", c.hostname)
 	if err != nil {
 		return err
